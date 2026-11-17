@@ -16,6 +16,7 @@ import { createCombat } from './combat.js';
 import { createEffects } from './effects.js';
 import { createBots } from './bots.js';
 import { createMatch } from './rounds.js';
+import { createStats } from './stats.js';
 import { createAudio } from './audio.js';
 import { createHud } from './hud.js';
 
@@ -50,6 +51,7 @@ scene.add(camera);
 const world = createWorld(scene);
 const effects = createEffects(scene);
 const audio = createAudio();
+const stats = createStats();
 const input = createInput(renderer.domElement, onLockChange);
 const weapons = createWeaponSet(camera);
 
@@ -143,6 +145,7 @@ function handleCombatHit(record, attacker) {
     const bot = record.owner.ref;
     const killed = bots.damage(bot, record.damage, record.part, attacker);
     if (attacker.kind === 'player') {
+      stats.recordHit(weapons.current, record.part, record.damage, killed);
       hud.hitMarker(killed);
       audio.hit(killed);
     }
@@ -199,6 +202,7 @@ const bots = createBots(scene, world, combat, random, {
 const match = createMatch({
   onMatchStart() {
     bots.resetMatch();
+    stats.reset();
     playerKills = 0;
     playerDeaths = 0;
     hud.setKills(0, 0);
@@ -215,13 +219,14 @@ const match = createMatch({
     }
   },
   onRoundEnd(winner, reason, a, b) {
+    stats.recordRound(match.state.round, winner, reason);
     hud.showBanner(winner === 'A' ? 'ROUND WON' : 'ROUND LOST', `${reason} · ${a} — ${b}`);
     audio.roundWin(winner === 'A');
     hud.setScore(a, b, match.state.round);
     hud.showBuy(false);
   },
   onMatchEnd(winner, a, b) {
-    hud.showOverlay('match', `${winner === 'A' ? 'Tidebreakers take the harbour' : 'Harbour Watch holds the docks'} — final score ${a} — ${b}.`);
+    hud.showOverlay('match', `${winner === 'A' ? 'Tidebreakers take the harbour' : 'Harbour Watch holds the docks'} — final score ${a} — ${b}. ${stats.summaryLine()}`);
     if (document.pointerLockElement) document.exitPointerLock();
   },
   onPlant(site) {
@@ -272,6 +277,7 @@ function damagePlayer(amount, attacker) {
   playerHealth = 0;
   playerState.alive = false;
   playerDeaths += 1;
+  stats.recordDeath();
   plantProgress = 0;
   plantingSite = null;
   hud.setKills(playerKills, playerDeaths);
@@ -397,6 +403,7 @@ function shootPlayer(spread) {
     audio.dry();
     return;
   }
+  stats.recordShot(weapons.current);
   camera.getWorldDirection(tmpV);
   tmpV.x += (random() * 2 - 1) * spread;
   tmpV.y += (random() * 2 - 1) * spread;
@@ -497,6 +504,7 @@ function drivePlayer(dt) {
       hud.setPlant(plantProgress, `PLANTING — SITE ${site}`);
       if (plantProgress >= 1) {
         match.plantBomb(site, playerBody.state.position);
+        stats.recordPlantDone();
         plantProgress = 0;
         plantingSite = null;
         hud.setPlant(0);
