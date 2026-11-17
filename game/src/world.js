@@ -124,6 +124,45 @@ export function createWorld(scene) {
     return mesh;
   }
 
+  // A forklift: a low body, a tall mast at the front, an overhead guard and a pair
+  // of forks. The body and the mast stop bullets and bodies; the guard and forks
+  // are thin enough to be visual only. It always faces north, toward the sites,
+  // which keeps the axis-aligned colliders exact.
+  function forklift(x, z) {
+    const parts = new THREE.Group();
+    parts.position.set(x, 0, z);
+    group.add(parts);
+    const bodyMesh = new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.0, 2.0), ochreMat);
+    bodyMesh.position.y = 0.5;
+    bodyMesh.castShadow = true;
+    bodyMesh.receiveShadow = true;
+    parts.add(bodyMesh);
+    const mast = new THREE.Mesh(new THREE.BoxGeometry(1.0, 2.3, 0.18), steelMat);
+    mast.position.set(0, 1.15, -1.05);
+    mast.castShadow = true;
+    parts.add(mast);
+    const guard = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.08, 1.4), steelMat);
+    guard.position.set(0, 1.95, 0.2);
+    parts.add(guard);
+    for (const dx of [-0.35, 0.35]) {
+      const fork = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.06, 1.1), steelMat);
+      fork.position.set(dx, 0.12, -1.5);
+      parts.add(fork);
+    }
+    colliders.push(new THREE.Box3(new THREE.Vector3(x - 0.6, 0, z - 1.05), new THREE.Vector3(x + 0.6, 1.0, z + 1.05)));
+    colliders.push(new THREE.Box3(new THREE.Vector3(x - 0.55, 0, z - 1.15), new THREE.Vector3(x + 0.55, 2.3, z - 0.95)));
+    shootables.push(bodyMesh, mast);
+  }
+
+  // A sandbag line: a row of low boxes, crouch cover that a bullet still clears.
+  function sandbags(x, z, count, alongX) {
+    for (let i = 0; i < count; i += 1) {
+      const dx = alongX ? (i - (count - 1) / 2) * 1.05 : 0;
+      const dz = alongX ? 0 : (i - (count - 1) / 2) * 1.05;
+      box(1.0, 0.55, 0.7, x + dx, 0.28, z + dz, crateMat);
+    }
+  }
+
   // Ground and outer walls (52 x 38 m, 4.2 m walls).
   const floor = new THREE.Mesh(new THREE.BoxGeometry(52.4, 0.4, 38.4), groundMat);
   floor.position.set(0, -0.2, 0);
@@ -169,6 +208,22 @@ export function createWorld(scene) {
   for (const [x, z] of [[-10, -1], [-8.5, -1.4], [10, -1], [8.5, -1.4], [-20, 12], [20, 12]]) {
     box(0.8, 1.0, 0.8, x, 0.5, z, rustMat);
   }
+
+  // Map v2 cover: forklifts on the two side lanes, sandbag lines at both spawns,
+  // corner container stacks, and a pair of crates guarding the north mid. All of
+  // it sits off the waypoint segments and off the capture sightlines.
+  forklift(-14, 8);
+  forklift(14, 8);
+  sandbags(-8, 12, 3, true);
+  sandbags(8, 12, 3, true);
+  sandbags(-10, -14, 3, true);
+  sandbags(10, -14, 3, true);
+  box(6, 2.6, 2.4, -22, 1.3, 16, tealMat);
+  box(6, 2.6, 2.4, -22, 3.9, 16, rustMat);
+  box(6, 2.6, 2.4, 22, 1.3, 16, rustMat);
+  box(6, 2.6, 2.4, 22, 3.9, 16, tealMat);
+  box(1.2, 1.1, 1.2, -2, 0.55, -14, crateMat);
+  box(1.2, 1.1, 1.2, 2, 0.55, -14, crateMat);
 
   // Site markers: glowing floor decal + light beam at each site centre.
   const sites = {
@@ -252,17 +307,19 @@ export function createWorld(scene) {
     { id: 'b1', x: 19, z: -9 }, { id: 'b2', x: 15, z: -11 }, { id: 'b3', x: 22, z: -11 },
     { id: 'ds0', x: -4, z: -15 }, { id: 'ds1', x: 0, z: -15 }, { id: 'ds2', x: 4, z: -15 },
     { id: 'hA', x: -17, z: -5 }, { id: 'hB', x: 17, z: -5 }, { id: 'hM', x: 0, z: -12 }, { id: 'hA2', x: -12, z: -8 }, { id: 'hB2', x: 12, z: -8 },
+    { id: 'fA', x: -14, z: 8 }, { id: 'fB', x: 14, z: 8 },
   ];
   const links = {
     as0: ['as1', 'al1', 'm1'], as1: ['as0', 'as2', 'm1'], as2: ['as1', 'bs1', 'm1'],
-    al1: ['as0', 'al2'], al2: ['al1', 'al3', 'm2'], al3: ['al2', 'al4', 'hA'], al4: ['al3', 'a1'],
+    al1: ['as0', 'al2', 'fA'], al2: ['al1', 'al3', 'm2', 'fA'], al3: ['al2', 'al4', 'hA'], al4: ['al3', 'a1'],
     m1: ['as1', 'm2'], m2: ['m1', 'm3', 'al2', 'bs2'], m3: ['m2', 'm4', 'hM'], m4: ['m3', 'hA2', 'hB2'],
-    bs1: ['as2', 'bs2'], bs2: ['bs1', 'bs3', 'm2'], bs3: ['bs2', 'bs4', 'hB'], bs4: ['bs3', 'b1'],
+    bs1: ['as2', 'bs2', 'fB'], bs2: ['bs1', 'bs3', 'm2', 'fB'], bs3: ['bs2', 'bs4', 'hB'], bs4: ['bs3', 'b1'],
     a1: ['al4', 'a2', 'a3'], a2: ['a1', 'hA2'], a3: ['a1', 'hA'],
     b1: ['bs4', 'b2', 'b3'], b2: ['b1', 'hB2'], b3: ['b1', 'hB'],
     ds0: ['ds1', 'hA', 'hM'], ds1: ['ds0', 'ds2', 'hM'], ds2: ['ds1', 'hB', 'hM'],
     hA: ['ds0', 'al3', 'a3', 'hA2'], hB: ['ds2', 'bs3', 'b3', 'hB2'], hM: ['ds1', 'm3', 'hA2', 'hB2'],
     hA2: ['hA', 'a2', 'm4', 'hM'], hB2: ['hB', 'b2', 'm4', 'hM'],
+    fA: ['al1', 'al2'], fB: ['bs1', 'bs2'],
   };
   const nodeById = new Map(nodes.map((n) => [n.id, n]));
 

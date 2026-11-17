@@ -1,8 +1,10 @@
-// Meridian Docks: boot and the one loop. A fixed 60 Hz simulation feeds a render at the
-// display's rate; the loop owns shooting, grenades, planting, buying and spectating, and
-// every other module owns one job. ?shot=start|play|plant|end with &seed=N sets up a
-// deterministic frame for a capture, renders it twice, then freezes it and sets
-// window.__shotReady. window.__diag carries a JSON status for headless verification.
+// Meridian Docks: boot and the one loop. A fixed 60 Hz simulation feeds a render at
+// the display's rate; the loop owns shooting, grenades, planting, buying and spectating,
+// and every other module owns one job. ?shot=start|play|plant|end with &seed=N stages
+// a deterministic frame for a capture, renders it twice, then freezes it and sets
+// window.__shotReady. window.__diag (and the #diag element) carry a JSON status for
+// headless verification. The shot scripts live in a small SHOTS table so a capture is
+// one named staging, not a branch in the loop.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 import { mulberry32 } from './rng.js';
@@ -22,6 +24,11 @@ const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seed = Number.parseInt(params.get('seed') ?? '1', 10) || 1;
 const random = mulberry32(seed);
+
+// The buy menu's catalogue, shared by the buy phase and the B key.
+const BUY_GUNS = [WEAPONS.rifle, WEAPONS.smg, WEAPONS.dmr];
+const BUY_NADES = [GRENADES.frag, GRENADES.smoke];
+const BUY_KEYS = { Digit1: 'rifle', Digit2: 'smg', Digit3: 'dmr', Digit4: 'frag', Digit5: 'smoke' };
 
 const diag = { errors: [], phase: 'boot', scoreA: 0, scoreB: 0, botsAlive: 0, playerAlive: true, shots: 0 };
 window.addEventListener('error', (e) => diag.errors.push(String(e.message || e.error)));
@@ -46,13 +53,14 @@ const audio = createAudio();
 const input = createInput(renderer.domElement, onLockChange);
 const weapons = createWeaponSet(camera);
 
-// The player: a body for movement, a simple mesh below eye level so bots can hit it.
-const playerBody = createBody(world.colliders, world.spawns.attack[0]);
-const playerMesh = new THREE.Group();
-{
+// The player figure: a body for movement and a simple mesh below eye level so the
+// bots can hit it. The torso and head are returned by reference so combat registers
+// the actual meshes instead of depending on their index in the group.
+function buildPlayerFigure() {
   const dark = new THREE.MeshStandardMaterial({ color: new THREE.Color('#20262e'), roughness: 0.85 });
   const vest = new THREE.MeshStandardMaterial({ color: new THREE.Color(PALETTE.accent), roughness: 0.6 });
   const skin = new THREE.MeshStandardMaterial({ color: new THREE.Color('#c9a184'), roughness: 0.7 });
+  const group = new THREE.Group();
   const legL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.5, 0.18), dark);
   legL.position.set(-0.11, 0.25, 0);
   const legR = legL.clone();
@@ -63,20 +71,26 @@ const playerMesh = new THREE.Group();
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.15, 12, 10), skin);
   head.position.y = 1.32;
   head.userData.part = 'head';
-  playerMesh.add(legL, legR, torso, head);
-  playerMesh.traverse((m) => {
-    if (m.isMesh) m.castShadow = true;
+  group.add(legL, legR, torso, head);
+  group.traverse((mesh) => {
+    if (mesh.isMesh) mesh.castShadow = true;
   });
-  scene.add(playerMesh);
+  scene.add(group);
+  return { group, torso, head };
 }
+
+const playerBody = createBody(world.colliders, world.spawns.attack[0]);
+const playerFigure = buildPlayerFigure();
 const playerOwner = { kind: 'player', ref: null };
 const playerState = {
   pos: playerBody.state.position,
   chestY: 1.2,
+  yaw: 0,
   alive: true,
 };
 playerOwner.ref = playerState;
 
+// Match state. The loop reads these; the hooks below write them.
 let playerHealth = 100;
 let playerKills = 0;
 let playerDeaths = 0;
@@ -122,7 +136,9 @@ function onLockChange(locked) {
   }
 }
 
-function onCombatHit(record, attacker) {
+// A combat hit lands on a bot or on the player; the caller owns health and scoring,
+// this only routes it. The player's own shots also light the hitmarker.
+function handleCombatHit(record, attacker) {
   if (record.kind === 'bot') {
     const bot = record.owner.ref;
     const killed = bots.damage(bot, record.damage, record.part, attacker);
@@ -135,9 +151,9 @@ function onCombatHit(record, attacker) {
   }
 }
 
-const combat = createCombat(scene, world, effects, onCombatHit);
-combat.registerTarget(playerMesh.children[2], playerOwner, 'torso');
-combat.registerTarget(playerMesh.children[3], playerOwner, 'head');
+const combat = createCombat(scene, world, effects, handleCombatHit);
+combat.registerTarget(playerFigure.torso, playerOwner, 'torso');
+combat.registerTarget(playerFigure.head, playerOwner, 'head');
 
 const bots = createBots(scene, world, combat, random, {
   onBotShot(bot) {
@@ -146,15 +162,28 @@ const bots = createBots(scene, world, combat, random, {
     bots.notifyShot(bot.body.state.position, bot.team, elapsed);
   },
   onBotDeath(bot, attacker, part) {
-    const killer = attacker.kind === 'player' ? 'You' : attacker.ref.name;
-    const weaponName = attacker.kind === 'player' ? WEAPONS[weapons.current].name : WEAPONS[attacker.ref.weaponId].name;
+    // The killer line: the player, a named bot, a frag grenade, or the world.
+    // Grenades and world damage have no bot to credit, and naming them here is
+    // what keeps the feed honest instead of crashing on a null reference.
+    let killer = 'the harbour';
+    let weaponName = '—';
+    if (attacker.kind === 'player') {
+      killer = 'You';
+      weaponName = WEAPONS[weapons.current].name;
+    } else if (attacker.kind === 'bot' && attacker.ref) {
+      killer = attacker.ref.name;
+      weaponName = WEAPONS[attacker.ref.weaponId].name;
+    } else if (attacker.kind === 'grenade') {
+      killer = 'Frag grenade';
+      weaponName = GRENADES.frag.name;
+    }
     hud.killFeed(killer, bot.name, weaponName, part === 'head');
     if (attacker.kind === 'player') {
       playerKills += 1;
       match.killReward();
       hud.setKills(playerKills, playerDeaths);
       hud.setMoney(match.state.money);
-    } else {
+    } else if (attacker.kind === 'bot' && attacker.ref) {
       attacker.ref.kills += 1;
     }
     if (bot.role === 'plant') bots.reassignCarrier(bot.id);
@@ -177,7 +206,7 @@ const match = createMatch({
   onPhase(phase, round) {
     if (phase === 'buy') {
       respawnAll(round);
-      hud.showBuy(true, [WEAPONS.rifle, WEAPONS.smg, WEAPONS.dmr], [GRENADES.frag, GRENADES.smoke], match.state.money, new Set(weapons.ownedIds()));
+      hud.showBuy(true, BUY_GUNS, BUY_NADES, match.state.money, new Set(weapons.ownedIds()));
       hud.setScore(match.state.scoreA, match.state.scoreB, round);
       hud.setMoney(match.state.money);
     } else if (phase === 'live') {
@@ -217,7 +246,7 @@ function respawnAll(round) {
   plantingSite = null;
   grenades.length = 0;
   weapons.refillAll();
-  playerMesh.visible = true;
+  playerFigure.group.visible = true;
   hud.setHealth(100);
   hud.setSpectate(null);
   hud.setAmmo(weapons.state().mag, weapons.state().reserve);
@@ -246,10 +275,14 @@ function damagePlayer(amount, attacker) {
   plantProgress = 0;
   plantingSite = null;
   hud.setKills(playerKills, playerDeaths);
-  playerMesh.visible = false;
+  playerFigure.group.visible = false;
   spectateBot = bots.list.find((b) => b.alive && b.team === 'A') || null;
   hud.setSpectate(spectateBot ? spectateBot.name : null);
   hud.showBanner('YOU ARE DOWN', spectateBot ? `Spectating ${spectateBot.name}` : 'No teammates left.');
+}
+
+function refreshBuyMenu() {
+  hud.showBuy(true, BUY_GUNS, BUY_NADES, match.state.money, new Set(weapons.ownedIds()));
 }
 
 function buyItem(id) {
@@ -272,7 +305,7 @@ function buyItem(id) {
   hud.setGrenades(fragCount, smokeCount);
   hud.setAmmo(weapons.state().mag, weapons.state().reserve);
   hud.setWeapon(WEAPONS[weapons.current].name);
-  hud.showBuy(true, [WEAPONS.rifle, WEAPONS.smg, WEAPONS.dmr], [GRENADES.frag, GRENADES.smoke], match.state.money, new Set(weapons.ownedIds()));
+  refreshBuyMenu();
 }
 
 function throwGrenade(kind) {
@@ -312,10 +345,9 @@ function explodeGrenade(g) {
     if (!combat.hasLineOfSight(g.pos, tmpV)) continue;
     const amount = Math.round(GRENADES.frag.damage * (1 - d / (GRENADES.frag.radius + 0.5)));
     if (v.kind === 'player') damagePlayer(amount, { kind: 'grenade', ref: null });
-    else {
-      const killed = bots.damage(v.ref, amount, 'torso', { kind: 'grenade', ref: null });
-      if (killed) hud.killFeed('Frag grenade', v.ref.name, GRENADES.frag.name, false);
-    }
+    // A frag kill is reported by onBotDeath, which owns the kill feed — this
+    // only applies the damage.
+    else bots.damage(v.ref, amount, 'torso', { kind: 'grenade', ref: null });
   }
 }
 
@@ -395,101 +427,105 @@ function syncCamera() {
   }
 }
 
+// What the bots get to know: the player, the bomb, the phase, and the clock. The
+// clock is what lets them push late in the round instead of holding forever.
 function botContext() {
   playerState.pos = playerBody.state.position;
   playerState.chestY = playerBody.state.crouching ? 0.75 : 1.2;
+  playerState.yaw = playerBody.state.yaw;
   return {
     player: playerState,
     bomb: match.state.bomb,
     phase: match.state.phase,
+    timeLeft: match.state.timeLeft,
   };
+}
+
+function pollKeys() {
+  const phase = match.state.phase;
+  const live = phase === 'live' || phase === 'planted';
+  const pressed = input.takePressed();
+  if (!started || shot) return;
+  for (const code of pressed) {
+    if (code === 'KeyM') audio.setMuted(!audio.isMuted());
+    if (code === 'KeyB' && phase === 'buy') refreshBuyMenu();
+    if (code === 'KeyR' && playerState.alive && weapons.reload()) audio.reload();
+    if (code === 'KeyG' && live) throwGrenade('frag');
+    if (code === 'KeyH' && live) throwGrenade('smoke');
+    if (code === 'KeyQ' && playerState.alive) {
+      const owned = weapons.ownedIds();
+      const next = owned[(owned.indexOf(weapons.current) + 1) % owned.length];
+      if (weapons.switchTo(next)) {
+        hud.setWeapon(WEAPONS[next].name);
+        hud.setAmmo(weapons.state().mag, weapons.state().reserve);
+      }
+    }
+    if (phase === 'buy') {
+      if (BUY_KEYS[code]) buyItem(BUY_KEYS[code]);
+    } else if (live && playerState.alive) {
+      const owned = weapons.ownedIds();
+      const switchMap = { Digit1: owned[0], Digit2: owned[1], Digit3: owned[2] };
+      if (switchMap[code] && weapons.switchTo(switchMap[code])) {
+        hud.setWeapon(WEAPONS[weapons.current].name);
+        hud.setAmmo(weapons.state().mag, weapons.state().reserve);
+      }
+    }
+  }
+}
+
+function drivePlayer(dt) {
+  const phase = match.state.phase;
+  const live = phase === 'live' || phase === 'planted';
+  if (!playerState.alive || !started || frozen) return;
+  const look = input.takeLook();
+  playerBody.look(look.x, look.y);
+  const def = WEAPONS[weapons.current];
+  const firing = input.state.firing;
+  if (firing && live && (def.auto || !prevFiring) && weapons.canFire()) {
+    shootPlayer(weapons.spread(playerBody.groundSpeed()));
+  }
+  prevFiring = firing;
+  // Planting: hold E inside a site during the live phase.
+  if (live && !match.state.bomb.planted && input.state.keys.has('KeyE')) {
+    let site = null;
+    for (const [name, s] of Object.entries(world.sites)) {
+      if (Math.hypot(playerBody.state.position.x - s.center.x, playerBody.state.position.z - s.center.z) < s.radius) site = name;
+    }
+    if (site) {
+      plantingSite = site;
+      plantProgress += dt / 3.5;
+      hud.setPlant(plantProgress, `PLANTING — SITE ${site}`);
+      if (plantProgress >= 1) {
+        match.plantBomb(site, playerBody.state.position);
+        plantProgress = 0;
+        plantingSite = null;
+        hud.setPlant(0);
+      }
+    } else {
+      plantProgress = 0;
+      hud.setPlant(0);
+    }
+  } else if (plantProgress > 0) {
+    plantProgress = 0;
+    hud.setPlant(0);
+  }
+  // Movement, with a footstep every couple of metres on the ground.
+  const before = playerBody.state.position.clone();
+  playerBody.step(dt, input.state.keys, input.state.aiming ? 0.55 : 1);
+  const moved = playerBody.state.position.distanceTo(before);
+  stepDistance += moved;
+  if (stepDistance > 2.2 && playerBody.state.onGround && moved > 0) {
+    stepDistance = 0;
+    audio.step();
+  }
 }
 
 function step(dt) {
   elapsed += dt;
   const phase = match.state.phase;
-  const live = phase === 'live' || phase === 'planted';
 
-  // Edge-triggered keys.
-  const pressed = input.takePressed();
-  if (started && !shot) {
-    for (const code of pressed) {
-      if (code === 'KeyM') audio.setMuted(!audio.isMuted());
-      if (code === 'KeyB' && phase === 'buy') {
-        hud.showBuy(true, [WEAPONS.rifle, WEAPONS.smg, WEAPONS.dmr], [GRENADES.frag, GRENADES.smoke], match.state.money, new Set(weapons.ownedIds()));
-      }
-      if (code === 'KeyR' && playerState.alive && weapons.reload()) audio.reload();
-      if (code === 'KeyG' && live) throwGrenade('frag');
-      if (code === 'KeyH' && live) throwGrenade('smoke');
-      if (code === 'KeyQ' && playerState.alive) {
-        const owned = weapons.ownedIds();
-        const next = owned[(owned.indexOf(weapons.current) + 1) % owned.length];
-        if (weapons.switchTo(next)) {
-          hud.setWeapon(WEAPONS[next].name);
-          hud.setAmmo(weapons.state().mag, weapons.state().reserve);
-        }
-      }
-      if (phase === 'buy') {
-        const buyMap = { Digit1: 'rifle', Digit2: 'smg', Digit3: 'dmr', Digit4: 'frag', Digit5: 'smoke' };
-        if (buyMap[code]) buyItem(buyMap[code]);
-      } else if (live && playerState.alive) {
-        const owned = weapons.ownedIds();
-        const switchMap = { Digit1: owned[0], Digit2: owned[1], Digit3: owned[2] };
-        if (switchMap[code] && weapons.switchTo(switchMap[code])) {
-          hud.setWeapon(WEAPONS[weapons.current].name);
-          hud.setAmmo(weapons.state().mag, weapons.state().reserve);
-        }
-      }
-    }
-  }
-
-  // Look and fire.
-  if (playerState.alive && started && !frozen) {
-    const look = input.takeLook();
-    playerBody.look(look.x, look.y);
-    const def = WEAPONS[weapons.current];
-    const firing = input.state.firing;
-    if (firing && live && (def.auto || !prevFiring) && weapons.canFire()) {
-      shootPlayer(weapons.spread(playerBody.groundSpeed()));
-    }
-    prevFiring = firing;
-    // Planting: hold E inside a site during the live phase.
-    if (live && !match.state.bomb.planted && input.state.keys.has('KeyE')) {
-      let site = null;
-      for (const [name, s] of Object.entries(world.sites)) {
-        if (Math.hypot(playerBody.state.position.x - s.center.x, playerBody.state.position.z - s.center.z) < s.radius) site = name;
-      }
-      if (site) {
-        plantingSite = site;
-        plantProgress += dt / 3.5;
-        hud.setPlant(plantProgress, `PLANTING — SITE ${site}`);
-        if (plantProgress >= 1) {
-          match.plantBomb(site, playerBody.state.position);
-          plantProgress = 0;
-          plantingSite = null;
-          hud.setPlant(0);
-        }
-      } else {
-        plantProgress = 0;
-        hud.setPlant(0);
-      }
-    } else if (plantProgress > 0) {
-      plantProgress = 0;
-      hud.setPlant(0);
-    }
-  }
-
-  // Movement.
-  if (playerState.alive && started && !frozen) {
-    const before = playerBody.state.position.clone();
-    playerBody.step(dt, input.state.keys, input.state.aiming ? 0.55 : 1);
-    const moved = playerBody.state.position.distanceTo(before);
-    stepDistance += moved;
-    if (stepDistance > 2.2 && playerBody.state.onGround && moved > 0) {
-      stepDistance = 0;
-      audio.step();
-    }
-  }
+  pollKeys();
+  drivePlayer(dt);
   weapons.step(dt, input.state.aiming && playerState.alive);
 
   // Aim-down-sights field of view.
@@ -510,17 +546,20 @@ function step(dt) {
   }
   shake = Math.max(0, shake - dt * 1.8);
 
-  // HUD (minimap throttled).
+  // HUD (minimap throttled to four times a second). The ammo line is refreshed
+  // every frame so a reload that finishes between shots shows up at once — the
+  // setter itself skips the write when nothing changed.
   hud.setHealth(playerHealth);
   hud.setTimer(match.state.timeLeft, match.state.bomb.planted);
   hud.setMoney(match.state.money);
+  hud.setAmmo(weapons.state().mag, weapons.state().reserve);
   hud.setCrosshair(6 + weapons.spread(playerBody.groundSpeed()) * 900);
   if (elapsed - minimapAt > 0.25) {
     minimapAt = elapsed;
     hud.drawMinimap(playerState, bots.list, match.state.bomb);
   }
-  playerMesh.position.copy(playerBody.state.position);
-  playerMesh.rotation.y = playerBody.state.yaw;
+  playerFigure.group.position.copy(playerBody.state.position);
+  playerFigure.group.rotation.y = playerBody.state.yaw;
   playerState.chestY = playerBody.state.crouching ? 0.75 : 1.2;
 }
 
@@ -578,19 +617,16 @@ function paintTwiceThenReady() {
   requestAnimationFrame(paint);
 }
 
-function runShot(name) {
-  started = true;
-  hud.hideOverlay();
-  hud.showBuy(false);
-  // Buy phase gives the bots their routes; settle so they walk out of spawn.
-  settle(30);
-  match.startLive();
-  if (name === 'start') {
+// One named staging per capture. Each one teleports the player, settles the sim,
+// and leaves the frame exactly where the screenshot wants it.
+const SHOTS = {
+  start() {
     playerBody.teleport(0, 14, 0);
     settle(20);
     aimAt(new THREE.Vector3(0, 1.5, -9));
     hud.showOverlay('start');
-  } else if (name === 'play') {
+  },
+  play() {
     playerBody.teleport(0, 6, 0);
     weapons.buy('rifle');
     weapons.switchTo('rifle');
@@ -621,13 +657,15 @@ function runShot(name) {
       settle(4);
     }
     hud.setAmmo(weapons.state().mag, weapons.state().reserve);
-  } else if (name === 'plant') {
+  },
+  plant() {
     playerBody.teleport(-19, -6, Math.PI * 0.9);
     settle(40);
     plantProgress = 0.62;
     hud.setPlant(0.62, 'PLANTING — SITE A');
     aimAt(new THREE.Vector3(-19, 1.2, -9));
-  } else if (name === 'end') {
+  },
+  end() {
     match.state.scoreA = 2;
     match.state.scoreB = 1;
     match.state.round = 4;
@@ -639,7 +677,17 @@ function runShot(name) {
     match.endRound('A', 'Harbour Watch eliminated');
     settle(10);
     hud.showBanner('ROUND WON', 'Harbour Watch eliminated · 3 — 1', true);
-  }
+  },
+};
+
+function runShot(name) {
+  started = true;
+  hud.hideOverlay();
+  hud.showBuy(false);
+  // Buy phase gives the bots their routes; settle so they walk out of spawn.
+  settle(30);
+  match.startLive();
+  SHOTS[name]();
   hud.setScore(match.state.scoreA, match.state.scoreB, match.state.round);
   hud.setAmmo(weapons.state().mag, weapons.state().reserve);
   hud.setHealth(playerHealth);
