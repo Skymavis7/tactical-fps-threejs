@@ -1,5 +1,9 @@
 # Meridian Docks — Tactical FPS
 
+[![make.fun · best-game-01](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![rank](https://make.fun/badge/best-game-01/Skymavis7/tactical-fps-threejs/rank.svg)](https://make.fun/bounty/best-game-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+[![reward](https://make.fun/badge/best-game-01/Skymavis7/tactical-fps-threejs/reward.svg)](https://make.fun/bounty/best-game-01?utm_source=github&utm_medium=readme&utm_campaign=best-game-01)
+
 A round-based 5v5 tactical FPS in the browser, built on three.js. Two teams
 fight over a dusk harbour: attackers plant the spike at Crane Yard or Container
 Row, defenders hold the angles. First to 4 rounds takes the match.
