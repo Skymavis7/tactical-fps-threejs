@@ -1,136 +1,226 @@
-// One body for every person in the game, player or bot: acceleration, friction, gravity,
-// crouch and jump, resolved as a box against the world's colliders one axis at a time, so a
-// wall never swallows a body. Bots drive it with a synthetic key set; the player with input.
+// Player — first-person movement, weapons, economy and the spike.
+// The player is a "fighter" (see combat.js) so bots and grenades can hurt
+// them through the same code path.
+
 import * as THREE from 'three';
+import { WEAPONS, GRENADES, freshLoadout, freshAmmo } from './weapons.js';
+import { input } from './input.js';
+import { sfx } from './audio.js';
 
-const RADIUS = 0.34;
-const STAND_HEIGHT = 1.72;
-const CROUCH_HEIGHT = 1.12;
-const STAND_EYE = 1.6;
-const CROUCH_EYE = 1.02;
+const EYE = 1.62;
+const RADIUS = 0.42;
 const WALK_SPEED = 4.6;
-const CROUCH_SPEED = 2.2;
-const GROUND_ACCEL = 42;
-const AIR_ACCEL = 9;
-const FRICTION = 9;
-const GRAVITY = 20;
-const JUMP_SPEED = 6.2;
+const SPRINT_SPEED = 6.9;
 
-export function createBody(colliders, spawn) {
-  const body = {
-    position: new THREE.Vector3(spawn.x, 0, spawn.z),
-    velocity: new THREE.Vector3(),
-    yaw: spawn.yaw ?? 0,
+export function createPlayer(ctx) {
+  const { world, rng } = ctx;
+  const p = {
+    id: 'player',
+    name: 'You',
+    team: 'atk',
+    alive: true,
+    hp: 100,
+    pos: { x: -23, z: 0 },
+    yaw: -Math.PI / 2,
     pitch: 0,
-    eye: STAND_EYE,
-    onGround: true,
-    crouching: false,
-    height: STAND_HEIGHT,
+    eyeY: EYE,
+    height: 1.8,
+    radius: RADIUS,
+    headY: 1.45,
+    money: 800,
+    kills: 0,
+    deaths: 0,
+    assists: 0,
+    loadout: freshLoadout(),
+    fireTimer: 0,
+    reloadTimer: 0,
+    reloading: false,
+    moving: false,
+    sprinting: false,
+    hasSpike: false,
+    channel: null, // {type:'plant'|'defuse', site, progress, needed}
+    stepTimer: 0,
+
+    get weapon() { return WEAPONS[this.loadout.current]; },
+    get ammo() { return this.loadout.ammo[this.loadout.current]; },
+
+    get aimDir() {
+      const cp = Math.cos(this.pitch);
+      return new THREE.Vector3(
+        -Math.sin(this.yaw) * cp,
+        Math.sin(this.pitch),
+        -Math.cos(this.yaw) * cp,
+      );
+    },
+
+    resetForRound(spawn, keepMoney = true) {
+      this.pos.x = spawn.x; this.pos.z = spawn.z;
+      this.yaw = -Math.PI / 2; this.pitch = 0;
+      this.hp = 100; this.alive = true;
+      this.fireTimer = 0; this.reloadTimer = 0; this.reloading = false;
+      this.channel = null;
+      if (!keepMoney) this.money = 800;
+      // refill the current magazine from reserve, free
+      const a = this.ammo;
+      if (a && a.reserve !== Infinity) {
+        const need = this.weapon.mag - a.mag;
+        const take = Math.min(need, a.reserve);
+        a.mag += take; a.reserve -= take;
+      } else if (a) {
+        a.mag = this.weapon.mag;
+      }
+    },
+
+    applyDamage(amount, src) {
+      if (!this.alive) return false;
+      this.hp -= amount;
+      sfx.hurt();
+      if (this.hp <= 0) {
+        this.hp = 0;
+        this.alive = false;
+        this.deaths++;
+        this.channel = null;
+        ctx.onDeath?.(this, src);
+        return true;
+      }
+      return false;
+    },
+
+    healFull() { this.hp = 100; },
+
+    update(dt, phase) {
+      if (!this.alive) return;
+      // look
+      const look = input.consumeLook();
+      this.yaw -= look.dx * 0.0023;
+      this.pitch = Math.max(-1.5, Math.min(1.5, this.pitch - look.dy * 0.0023));
+
+      // move (WASD relative to yaw; disabled while channelling)
+      const fwd = { x: -Math.sin(this.yaw), z: -Math.cos(this.yaw) };
+      const right = { x: -fwd.z, z: fwd.x };
+      let mx = 0, mz = 0;
+      const channelling = this.channel !== null;
+      if (!channelling) {
+        if (input.down('KeyW')) { mx += fwd.x; mz += fwd.z; }
+        if (input.down('KeyS')) { mx -= fwd.x; mz -= fwd.z; }
+        if (input.down('KeyD')) { mx += right.x; mz += right.z; }
+        if (input.down('KeyA')) { mx -= right.x; mz -= right.z; }
+      }
+      const len = Math.hypot(mx, mz);
+      this.moving = len > 0;
+      this.sprinting = this.moving && input.down('ShiftLeft') && input.down('KeyW') && !channelling;
+      if (len > 0) {
+        const speed = this.sprinting ? SPRINT_SPEED : WALK_SPEED;
+        this.pos.x += (mx / len) * speed * dt;
+        this.pos.z += (mz / len) * speed * dt;
+        world.resolveCircle(this.pos, RADIUS);
+        this.stepTimer -= dt;
+        if (this.stepTimer <= 0 && this.moving) {
+          this.stepTimer = this.sprinting ? 0.32 : 0.45;
+          sfx.step();
+        }
+      }
+
+      // weapon switching (not while the buy menu owns the number keys)
+      if (!ctx.buyOpen?.()) {
+        const order = ['pistol', 'smg', 'rifle', 'dmr'];
+        for (let i = 0; i < order.length; i++) {
+          if (input.consumePress(`Digit${i + 1}`)) this.switchWeapon(order[i]);
+        }
+        if (input.consumePress('KeyR')) this.startReload();
+        if (input.consumePress('Digit5')) ctx.throwGrenade?.('frag', this);
+        if (input.consumePress('Digit6')) ctx.throwGrenade?.('smoke', this);
+      }
+
+      // fire
+      this.fireTimer -= dt;
+      if (this.reloadTimer > 0) {
+        this.reloadTimer -= dt;
+        if (this.reloadTimer <= 0) this.finishReload();
+      }
+      const w = this.weapon;
+      const wantFire = w.auto ? input.mouseDown : input.consumeClick();
+      if (wantFire && phase === 'live' && !this.reloading && this.fireTimer <= 0) {
+        this.fire();
+      }
+    },
+
+    fire() {
+      const w = this.weapon;
+      const a = this.ammo;
+      if (!a || a.mag <= 0) {
+        sfx.dryFire();
+        this.startReload();
+        return;
+      }
+      a.mag--;
+      this.fireTimer = 60 / w.fireRate;
+      ctx.fireHitscan?.(this);
+    },
+
+    startReload() {
+      const w = this.weapon;
+      const a = this.ammo;
+      if (this.reloading || !a || a.mag >= w.mag) return;
+      if (a.reserve !== Infinity && a.reserve <= 0) return;
+      this.reloading = true;
+      this.reloadTimer = w.reload;
+      sfx.reload();
+    },
+
+    finishReload() {
+      const w = this.weapon;
+      const a = this.ammo;
+      this.reloading = false;
+      if (!a) return;
+      const need = w.mag - a.mag;
+      if (a.reserve === Infinity) {
+        a.mag = w.mag;
+      } else {
+        const take = Math.min(need, a.reserve);
+        a.mag += take;
+        a.reserve -= take;
+      }
+    },
+
+    switchWeapon(id) {
+      if (!this.loadout.owned[id]) return false;
+      if (this.loadout.current === id) return true;
+      this.loadout.current = id;
+      this.reloading = false;
+      this.reloadTimer = 0;
+      this.fireTimer = Math.max(this.fireTimer, 0.15);
+      return true;
+    },
+
+    buy(id) {
+      if (WEAPONS[id]) {
+        const w = WEAPONS[id];
+        if (this.loadout.owned[id]) {
+          this.switchWeapon(id);
+          return { ok: true, note: 'equipped' };
+        }
+        if (this.money < w.price) return { ok: false, reason: 'Not enough money' };
+        this.money -= w.price;
+        this.loadout.owned[id] = true;
+        this.loadout.ammo[id] = freshAmmo(w);
+        this.switchWeapon(id);
+        sfx.buy();
+        return { ok: true, note: `Bought ${w.name}` };
+      }
+      if (GRENADES[id]) {
+        const g = GRENADES[id];
+        if (this.loadout.grenades[id] >= 2) return { ok: false, reason: 'Carrying max' };
+        if (this.money < g.price) return { ok: false, reason: 'Not enough money' };
+        this.money -= g.price;
+        this.loadout.grenades[id]++;
+        sfx.buy();
+        return { ok: true, note: `Bought ${g.name}` };
+      }
+      return { ok: false, reason: 'Unknown item' };
+    },
+
+    award(amount) { this.money += amount; },
   };
-  const probe = new THREE.Box3();
-  const wish = new THREE.Vector3();
-
-  function overlaps(x, y, z, height, lift) {
-    probe.min.set(x - RADIUS, y + lift, z - RADIUS);
-    probe.max.set(x + RADIUS, y + height - lift, z + RADIUS);
-    for (const collider of colliders) if (probe.intersectsBox(collider)) return collider;
-    return null;
-  }
-
-  function look(dx, dy, sensitivity = 0.0022) {
-    body.yaw -= dx * sensitivity;
-    body.pitch = Math.max(-1.45, Math.min(1.45, body.pitch - dy * sensitivity));
-  }
-
-  function recoil(pitchKick, yawKick) {
-    body.pitch = Math.min(1.45, body.pitch + pitchKick);
-    body.yaw += yawKick;
-  }
-
-  // keys is a Set of codes (KeyW/KeyA/KeyS/KeyD/Space/ControlLeft/KeyC) — real or synthetic.
-  function step(dt, keys, speedScale = 1) {
-    const crouching = keys.has('ControlLeft') || keys.has('ControlRight') || keys.has('KeyC');
-    if (crouching && !body.crouching) {
-      body.crouching = true;
-      body.height = CROUCH_HEIGHT;
-    } else if (!crouching && body.crouching && !overlaps(body.position.x, body.position.y, body.position.z, STAND_HEIGHT, 0.02)) {
-      body.crouching = false;
-      body.height = STAND_HEIGHT;
-    }
-    const eyeTarget = body.crouching ? CROUCH_EYE : STAND_EYE;
-    body.eye += (eyeTarget - body.eye) * Math.min(1, dt * 12);
-
-    const forward = (keys.has('KeyW') ? 1 : 0) - (keys.has('KeyS') ? 1 : 0);
-    const strafe = (keys.has('KeyD') ? 1 : 0) - (keys.has('KeyA') ? 1 : 0);
-    wish.set(0, 0, 0);
-    if (forward || strafe) {
-      const sin = Math.sin(body.yaw);
-      const cos = Math.cos(body.yaw);
-      wish.set(-sin * forward + cos * strafe, 0, -cos * forward - sin * strafe).normalize();
-    }
-
-    const speed = (body.crouching ? CROUCH_SPEED : WALK_SPEED) * speedScale;
-    const blend = Math.min(1, (body.onGround ? GROUND_ACCEL : AIR_ACCEL) * dt / speed);
-    body.velocity.x += (wish.x * speed - body.velocity.x) * blend;
-    body.velocity.z += (wish.z * speed - body.velocity.z) * blend;
-    if (body.onGround && !wish.lengthSq()) {
-      const damp = Math.max(0, 1 - FRICTION * dt);
-      body.velocity.x *= damp;
-      body.velocity.z *= damp;
-    }
-
-    if (keys.has('Space') && body.onGround) {
-      body.velocity.y = JUMP_SPEED;
-      body.onGround = false;
-    }
-    body.velocity.y -= GRAVITY * dt;
-
-    const nextX = body.position.x + body.velocity.x * dt;
-    if (!overlaps(nextX, body.position.y, body.position.z, body.height, 0.04)) body.position.x = nextX;
-    else body.velocity.x = 0;
-    const nextZ = body.position.z + body.velocity.z * dt;
-    if (!overlaps(body.position.x, body.position.y, nextZ, body.height, 0.04)) body.position.z = nextZ;
-    else body.velocity.z = 0;
-
-    body.position.y += body.velocity.y * dt;
-    body.onGround = false;
-    const hit = overlaps(body.position.x, body.position.y, body.position.z, body.height, 0);
-    if (hit && body.velocity.y <= 0) {
-      body.position.y = hit.max.y;
-      body.velocity.y = 0;
-      body.onGround = true;
-    } else if (hit) {
-      body.position.y = hit.min.y - body.height;
-      body.velocity.y = 0;
-    }
-    if (body.position.y < 0) {
-      body.position.y = 0;
-      body.velocity.y = 0;
-      body.onGround = true;
-    }
-    body.velocity.y = Math.max(-30, body.velocity.y);
-  }
-
-  return {
-    state: body,
-    step,
-    look,
-    recoil,
-    eyePos(out) {
-      out.set(body.position.x, body.position.y + body.eye, body.position.z);
-      return out;
-    },
-    groundSpeed() {
-      return Math.hypot(body.velocity.x, body.velocity.z);
-    },
-    teleport(x, z, yaw) {
-      body.position.set(x, 0, z);
-      body.velocity.set(0, 0, 0);
-      body.yaw = yaw;
-      body.pitch = 0;
-      body.crouching = false;
-      body.height = STAND_HEIGHT;
-      body.eye = STAND_EYE;
-    },
-  };
+  return p;
 }

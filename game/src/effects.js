@@ -1,188 +1,163 @@
-// Effects: pooled tracers, impact sparks, smoke clouds and explosions. Everything is
-// created once and reused, so the hot loop allocates nothing. Smoke also answers the
-// combat question "does this line cross a cloud?" — a cloud blocks sight and shots.
+// Effects — tracers, muzzle flashes, impact sparks, explosions and smoke.
+// Everything is transient: each effect has a lifetime and is removed when it
+// expires, so the scene never accumulates garbage.
+
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
 
-function radialTexture() {
-  const canvas = document.createElement('canvas');
-  canvas.width = 128;
-  canvas.height = 128;
-  const ctx = canvas.getContext('2d');
-  const gradient = ctx.createRadialGradient(64, 64, 4, 64, 64, 64);
-  gradient.addColorStop(0, 'rgba(200,205,210,0.55)');
-  gradient.addColorStop(0.6, 'rgba(160,168,175,0.32)');
-  gradient.addColorStop(1, 'rgba(160,168,175,0)');
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, 128, 128);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
-}
-
 export function createEffects(scene) {
-  const tracerMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.lamp), transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false });
-  const tracers = [];
-  for (let i = 0; i < 16; i += 1) {
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.02, 0.02, 1), tracerMat);
-    mesh.visible = false;
-    scene.add(mesh);
-    tracers.push({ mesh, life: 0 });
-  }
-  let tracerNext = 0;
+  const live = [];
+  const smokeZones = []; // {x, z, r, until} — bots treat these as vision blockers
 
-  const impactMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
-  const impacts = [];
-  for (let i = 0; i < 12; i += 1) {
-    const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.07, 8, 6), impactMat.clone());
-    mesh.visible = false;
+  function add(mesh, life, onTick) {
     scene.add(mesh);
-    impacts.push({ mesh, life: 0 });
+    const e = { mesh, life, age: 0, onTick };
+    live.push(e);
+    return e;
   }
-  let impactNext = 0;
 
-  const smokeTex = radialTexture();
-  const smokes = [];
-  for (let i = 0; i < 4; i += 1) {
-    const group = new THREE.Group();
-    const sprites = [];
-    for (let j = 0; j < 6; j += 1) {
-      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: smokeTex, transparent: true, opacity: 0, depthWrite: false }));
-      sprite.scale.set(3, 3, 1);
-      group.add(sprite);
-      sprites.push(sprite);
+  function tracer(from, to, team) {
+    const geo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(from.x, from.y, from.z),
+      new THREE.Vector3(to.x, to.y, to.z),
+    ]);
+    const mat = new THREE.LineBasicMaterial({
+      color: team === 'atk' ? PALETTE.tracerAtk : PALETTE.tracerDef,
+      transparent: true, opacity: 0.9,
+    });
+    const line = new THREE.Line(geo, mat);
+    add(line, 0.09, (e) => { e.mesh.material.opacity = 0.9 * (1 - e.age / e.life); });
+    return line;
+  }
+
+  function muzzleFlash(pos, dir) {
+    const geo = new THREE.PlaneGeometry(0.34, 0.34);
+    const mat = new THREE.MeshBasicMaterial({
+      color: PALETTE.muzzle, transparent: true, opacity: 0.95,
+      side: THREE.DoubleSide, depthWrite: false,
+    });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(pos.x + dir.x * 0.5, pos.y + dir.y * 0.5, pos.z + dir.z * 0.5);
+    m.lookAt(pos.x + dir.x * 2, pos.y + dir.y * 2, pos.z + dir.z * 2);
+    add(m, 0.05, (e) => { e.mesh.material.opacity = 0.95 * (1 - e.age / e.life); });
+  }
+
+  function impact(pos, color = 0xffc27a) {
+    const n = 10;
+    const positions = new Float32Array(n * 3);
+    const vels = [];
+    for (let i = 0; i < n; i++) {
+      positions[i * 3] = pos.x; positions[i * 3 + 1] = pos.y; positions[i * 3 + 2] = pos.z;
+      const a = Math.random() * Math.PI * 2, b = (Math.random() - 0.3) * Math.PI;
+      const s = 2 + Math.random() * 3.5;
+      vels.push([Math.cos(a) * Math.cos(b) * s, Math.sin(b) * s + 1.5, Math.sin(a) * Math.cos(b) * s]);
     }
-    group.visible = false;
-    scene.add(group);
-    smokes.push({ group, sprites, center: new THREE.Vector3(), radius: 4.5, life: 0, duration: 0, active: false, seed: i * 1.7 });
-  }
-  let smokeNext = 0;
-
-  const flashLight = new THREE.PointLight(new THREE.Color(PALETTE.accent), 0, 26, 1.4);
-  scene.add(flashLight);
-  const blast = new THREE.Mesh(
-    new THREE.SphereGeometry(1, 16, 12),
-    new THREE.MeshBasicMaterial({ color: new THREE.Color(PALETTE.accent), transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false }),
-  );
-  blast.visible = false;
-  scene.add(blast);
-  let blastLife = 0;
-
-  const tmp = new THREE.Vector3();
-  const tmp2 = new THREE.Vector3();
-
-  function tracer(from, to) {
-    const item = tracers[tracerNext];
-    tracerNext = (tracerNext + 1) % tracers.length;
-    const distance = from.distanceTo(to);
-    item.mesh.position.copy(from).add(to).multiplyScalar(0.5);
-    item.mesh.lookAt(to);
-    item.mesh.scale.set(1, 1, Math.max(0.1, distance));
-    item.mesh.visible = true;
-    item.mesh.material.opacity = 0.85;
-    item.life = 0.07;
-  }
-
-  function impact(point, kind) {
-    const item = impacts[impactNext];
-    impactNext = (impactNext + 1) % impacts.length;
-    item.mesh.position.copy(point);
-    item.mesh.material.color.set(kind === 'head' ? PALETTE.danger : kind === 'smoke' ? '#9aa5ad' : PALETTE.accent);
-    item.mesh.scale.setScalar(kind === 'head' ? 1.8 : 1);
-    item.mesh.visible = true;
-    item.mesh.material.opacity = 0.9;
-    item.life = 0.16;
-  }
-
-  function addSmoke(center, duration, radius = 4.5) {
-    const cloud = smokes[smokeNext];
-    smokeNext = (smokeNext + 1) % smokes.length;
-    cloud.center.copy(center);
-    cloud.radius = radius;
-    cloud.duration = duration;
-    cloud.life = duration;
-    cloud.active = true;
-    cloud.group.position.copy(center);
-    cloud.group.visible = true;
-    cloud.sprites.forEach((sprite, j) => {
-      const angle = cloud.seed + (j / cloud.sprites.length) * Math.PI * 2;
-      sprite.position.set(Math.cos(angle) * radius * 0.45, 0.6 + (j % 3) * 0.9, Math.sin(angle) * radius * 0.45);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.PointsMaterial({ color, size: 0.09, transparent: true, opacity: 1 });
+    const pts = new THREE.Points(geo, mat);
+    add(pts, 0.35, (e) => {
+      const arr = e.mesh.geometry.attributes.position.array;
+      for (let i = 0; i < n; i++) {
+        vels[i][1] -= 9 * 0.016;
+        arr[i * 3] += vels[i][0] * 0.016;
+        arr[i * 3 + 1] = Math.max(0.02, arr[i * 3 + 1] + vels[i][1] * 0.016);
+        arr[i * 3 + 2] += vels[i][2] * 0.016;
+      }
+      e.mesh.geometry.attributes.position.needsUpdate = true;
+      e.mesh.material.opacity = 1 - e.age / e.life;
     });
   }
 
-  function explosion(point) {
-    flashLight.position.copy(point);
-    flashLight.position.y += 1;
-    flashLight.intensity = 260;
-    blast.position.copy(point);
-    blast.visible = true;
-    blastLife = 0.35;
+  function explosion(pos) {
+    const mesh = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 16, 12),
+      new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.9 }),
+    );
+    mesh.position.set(pos.x, Math.max(0.6, pos.y), pos.z);
+    const light = new THREE.PointLight(0xff8a2a, 60, 22, 1.6);
+    light.position.copy(mesh.position);
+    scene.add(light);
+    add(mesh, 0.55, (e) => {
+      const k = e.age / e.life;
+      e.mesh.scale.setScalar(1 + k * 9);
+      e.mesh.material.opacity = 0.9 * (1 - k);
+      light.intensity = 60 * (1 - k);
+      if (k >= 1) scene.remove(light);
+    });
+    impact(pos, 0xff6a2a);
   }
 
-  // Segment-sphere test against active clouds. Returns the entry point or null.
-  function smokeHit(a, b) {
-    for (const cloud of smokes) {
-      if (!cloud.active) continue;
-      tmp.copy(b).sub(a);
-      const length = tmp.length();
-      if (length < 0.001) continue;
-      tmp.normalize();
-      tmp2.copy(cloud.center).sub(a);
-      const along = tmp2.dot(tmp);
-      if (along < 0 || along > length) continue;
-      const perp = Math.sqrt(Math.max(0, tmp2.lengthSq() - along * along));
-      if (perp < cloud.radius * 0.8) {
-        const entry = along - Math.sqrt(Math.max(0, (cloud.radius * 0.8) ** 2 - perp * perp));
-        return a.clone().addScaledVector(tmp, Math.max(0, entry));
-      }
+  function smoke(pos, radius, duration, now) {
+    smokeZones.push({ x: pos.x, z: pos.z, r: radius, until: now + duration });
+    const group = new THREE.Group();
+    for (let i = 0; i < 9; i++) {
+      const puff = new THREE.Mesh(
+        new THREE.SphereGeometry(1 + Math.random() * 0.9, 10, 8),
+        new THREE.MeshBasicMaterial({ color: PALETTE.smoke, transparent: true, opacity: 0.42, depthWrite: false }),
+      );
+      const a = Math.random() * Math.PI * 2, d = Math.random() * radius * 0.6;
+      puff.position.set(pos.x + Math.cos(a) * d, 0.5 + Math.random() * 1.6, pos.z + Math.sin(a) * d);
+      group.add(puff);
     }
-    return null;
+    add(group, duration, (e) => {
+      const k = e.age / e.life;
+      for (const puff of e.mesh.children) {
+        puff.material.opacity = 0.42 * (k < 0.8 ? 1 : (1 - k) / 0.2);
+        puff.scale.setScalar(1 + k * 0.35);
+      }
+    });
   }
 
-  function step(dt) {
-    for (const item of tracers) {
-      if (item.life <= 0) continue;
-      item.life -= dt;
-      if (item.life <= 0) item.mesh.visible = false;
-      else item.mesh.material.opacity = Math.max(0, item.life / 0.07) * 0.85;
+  // A floating damage / event marker that rises and fades (used sparingly).
+  function ring(pos, color) {
+    const mesh = new THREE.Mesh(
+      new THREE.RingGeometry(0.4, 0.55, 24),
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85, side: THREE.DoubleSide }),
+    );
+    mesh.rotation.x = -Math.PI / 2;
+    mesh.position.set(pos.x, 0.05, pos.z);
+    add(mesh, 0.7, (e) => {
+      const k = e.age / e.life;
+      e.mesh.scale.setScalar(1 + k * 2.2);
+      e.mesh.material.opacity = 0.85 * (1 - k);
+    });
+  }
+
+  function inSmoke(x1, y1, z1, x2, y2, z2, now) {
+    // a sight line is blocked if it passes within a live smoke zone (2D test
+    // at the segment's midpoint height — smoke fills 0..2.5 m)
+    const midY = (y1 + y2) / 2;
+    if (midY > 2.6) return false;
+    for (const s of smokeZones) {
+      if (now > s.until) continue;
+      // distance from zone centre to the 2D segment
+      const dx = x2 - x1, dz = z2 - z1;
+      const len2 = dx * dx + dz * dz;
+      let t = len2 === 0 ? 0 : ((s.x - x1) * dx + (s.z - z1) * dz) / len2;
+      t = Math.max(0, Math.min(1, t));
+      const cx = x1 + dx * t, cz = z1 + dz * t;
+      if (Math.hypot(s.x - cx, s.z - cz) < s.r) return true;
     }
-    for (const item of impacts) {
-      if (item.life <= 0) continue;
-      item.life -= dt;
-      if (item.life <= 0) item.mesh.visible = false;
-      else {
-        item.mesh.scale.multiplyScalar(1 + dt * 6);
-        item.mesh.material.opacity = Math.max(0, item.life / 0.16) * 0.9;
+    return false;
+  }
+
+  function update(dt, now = 0) {
+    for (let i = live.length - 1; i >= 0; i--) {
+      const e = live[i];
+      e.age += dt;
+      e.onTick?.(e);
+      if (e.age >= e.life) {
+        scene.remove(e.mesh);
+        e.mesh.geometry?.dispose?.();
+        e.mesh.material?.dispose?.();
+        live.splice(i, 1);
       }
     }
-    for (const cloud of smokes) {
-      if (!cloud.active) continue;
-      cloud.life -= dt;
-      if (cloud.life <= 0) {
-        cloud.active = false;
-        cloud.group.visible = false;
-        continue;
-      }
-      const age = cloud.duration - cloud.life;
-      const grow = Math.min(1, age / 2);
-      const fade = Math.min(1, cloud.life / 2);
-      cloud.sprites.forEach((sprite) => {
-        sprite.scale.set(3 + grow * 3.4, 3 + grow * 3.4, 1);
-        sprite.material.opacity = 0.5 * grow * fade;
-      });
-    }
-    if (blastLife > 0) {
-      blastLife -= dt;
-      const t = Math.max(0, blastLife / 0.35);
-      blast.scale.setScalar(1 + (1 - t) * 7);
-      blast.material.opacity = t * 0.85;
-      flashLight.intensity = 260 * t;
-      if (blastLife <= 0) {
-        blast.visible = false;
-        flashLight.intensity = 0;
-      }
+    for (let i = smokeZones.length - 1; i >= 0; i--) {
+      if (smokeZones[i].until < now) smokeZones.splice(i, 1);
     }
   }
 
-  return { tracer, impact, addSmoke, explosion, smokeHit, step };
+  return { tracer, muzzleFlash, impact, explosion, smoke, ring, inSmoke, smokeZones, update };
 }

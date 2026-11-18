@@ -1,261 +1,245 @@
-// The DOM HUD: health, ammunition, timer, score, money, kill feed, minimap, buy menu
-// and the overlay panels. It never touches the simulation; main.js pushes numbers in
-// and reads the button callbacks out. Every setter skips a write when nothing changed,
-// and the minimap is redrawn from scratch on each call — it is cheap at four frames
-// a second and it means the map can never go stale.
-export function createHud(world, hooks) {
+// HUD — every DOM element the player sees: vitals, weapon, timer, score,
+// money, minimap, kill feed, banners, buy menu and the plant bar. The game
+// writes state here; this module never writes game state back, except the
+// buy menu's click-to-buy rows.
+
+import { WEAPONS, WEAPON_ORDER, GRENADES } from './weapons.js';
+
+export function createHud(ctx) {
+  const { G, player, bots, world } = ctx;
   const $ = (id) => document.getElementById(id);
-  const els = {};
-  for (const id of [
-    'health-fill', 'health-num', 'ammo-mag', 'ammo-reserve', 'weapon-name', 'timer',
-    'score', 'money', 'kills', 'feed', 'banner', 'banner-title', 'banner-sub',
-    'crosshair', 'hitmarker', 'vignette', 'overlay', 'overlay-title', 'overlay-copy',
-    'play', 'buy-menu', 'buy-money', 'buy-list', 'plant-bar', 'plant-fill',
-    'plant-label', 'minimap', 'spectate', 'grenades', 'round-label',
-  ]) {
-    els[id] = $(id);
-  }
-
-  const mapCtx = els['minimap'].getContext('2d');
-  const MAP_SIZE = 168;
-  const bounds = world.bounds;
-  const toMapX = (x) => ((x - bounds.minX) / (bounds.maxX - bounds.minX)) * MAP_SIZE;
-  const toMapY = (z) => ((z - bounds.minZ) / (bounds.maxZ - bounds.minZ)) * MAP_SIZE;
-
-  const COPY = {
-    start: {
-      title: 'MERIDIAN DOCKS',
-      copy: 'Tidebreakers attack. Plant the surge charge at Site A or Site B — or eliminate the Harbour Watch. First to 4 rounds takes the harbour.',
-      action: 'Click to play',
-    },
-    paused: { title: 'MERIDIAN DOCKS', copy: 'Paused. Click to resume.', action: 'Click to resume' },
-    end: { title: 'Round over', copy: '', action: 'Next round' },
-    match: { title: 'Match over', copy: '', action: 'Play again' },
+  const els = {
+    cross: $('cross'), hitmark: $('hitmark'),
+    vitals: $('vitals'), hpfill: $('hpfill'), hptext: $('hptext'),
+    weapon: $('weapon'), wname: $('wname'), ammo: $('ammo'), slots: $('slots'),
+    topbar: $('topbar'), timer: $('timer'), score: $('score'), phase: $('phase'),
+    wallet: $('wallet'), money: $('money'), kd: $('kd'), round: $('round'),
+    minimap: $('minimap'), feed: $('feed'),
+    banner: $('banner'), plant: $('plant'), plantfill: $('plantfill'),
+    plantLabel: document.querySelector('#plant .label'),
+    hint: $('hint'), buy: $('buy'), buylist: $('buylist'), buybal: $('buybal'),
+    spectate: $('spectate'),
   };
-
-  // Last-written values, so a setter that repeats itself costs nothing.
-  const last = new Map();
+  const mm = els.minimap.getContext('2d');
+  const spotted = new Map(); // bot id -> timestamp until which it is shown
   let hitTimer = 0;
   let bannerTimer = 0;
 
-  function setText(el, key, value) {
-    if (last.get(key) === value) return;
-    last.set(key, value);
-    el.textContent = value;
-  }
-
-  function drawMinimap(player, bots, bomb) {
-    const ctx = mapCtx;
-    ctx.clearRect(0, 0, MAP_SIZE, MAP_SIZE);
-    // Dusk water under everything.
-    ctx.fillStyle = 'rgba(13,20,29,0.85)';
-    ctx.fillRect(0, 0, MAP_SIZE, MAP_SIZE);
-    // A faint grid, so distance reads at a glance.
-    ctx.strokeStyle = 'rgba(53,66,79,0.35)';
-    ctx.lineWidth = 1;
-    for (let g = 1; g < 4; g += 1) {
-      ctx.beginPath();
-      ctx.moveTo((MAP_SIZE / 4) * g, 0);
-      ctx.lineTo((MAP_SIZE / 4) * g, MAP_SIZE);
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(0, (MAP_SIZE / 4) * g);
-      ctx.lineTo(MAP_SIZE, (MAP_SIZE / 4) * g);
-      ctx.stroke();
-    }
-    // Site zones: a soft circle and a letter, so the objective reads instantly.
-    ctx.font = 'bold 13px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (const [name, site] of Object.entries(world.sites)) {
-      const cx = toMapX(site.center.x);
-      const cy = toMapY(site.center.z);
-      const r = ((site.radius * 2) / (bounds.maxX - bounds.minX)) * MAP_SIZE;
-      ctx.fillStyle = name === 'A' ? 'rgba(255,138,42,0.14)' : 'rgba(53,196,181,0.14)';
-      ctx.beginPath();
-      ctx.arc(cx, cy, r, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = name === 'A' ? '#ff8a2a' : '#35c4b5';
-      ctx.fillText(name, cx, cy);
-    }
-    // Cover blocks.
-    ctx.fillStyle = '#35424f';
-    for (const box of world.colliders) {
-      const w = toMapX(box.max.x) - toMapX(box.min.x);
-      const h = toMapY(box.max.z) - toMapY(box.min.z);
-      if (w < 1 && h < 1) continue;
-      ctx.fillRect(toMapX(box.min.x), toMapY(box.min.z), Math.max(1, w), Math.max(1, h));
-    }
-    // The planted charge: a red dot with a ring.
-    if (bomb.planted) {
-      const bx = toMapX(bomb.pos.x);
-      const by = toMapY(bomb.pos.z);
-      ctx.strokeStyle = '#e5484d';
-      ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      ctx.arc(bx, by, 7, 0, Math.PI * 2);
-      ctx.stroke();
-      ctx.fillStyle = '#e5484d';
-      ctx.beginPath();
-      ctx.arc(bx, by, 3.5, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    // Living bots, team-coloured.
-    for (const bot of bots) {
-      if (!bot.alive) continue;
-      ctx.fillStyle = bot.team === 'A' ? '#ff8a2a' : '#35c4b5';
-      ctx.beginPath();
-      ctx.arc(toMapX(bot.body.state.position.x), toMapY(bot.body.state.position.z), 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    // The player: an arrow that points the way the player is facing. The angle is
-    // measured clockwise from map-up, which is world -z.
-    if (player.alive) {
-      const x = toMapX(player.pos.x);
-      const y = toMapY(player.pos.z);
-      const yaw = player.yaw ?? 0;
-      ctx.fillStyle = '#ece7db';
-      ctx.save();
-      ctx.translate(x, y);
-      ctx.rotate(Math.atan2(-Math.sin(yaw), Math.cos(yaw)));
-      ctx.beginPath();
-      ctx.moveTo(0, -6);
-      ctx.lineTo(4, 5);
-      ctx.lineTo(-4, 5);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-    }
-  }
-
-  function buyRow(def, label, disabled, afford) {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = 'buy-row';
-    row.disabled = disabled || !afford;
-    row.innerHTML = `<b>${def.name}</b><span>${def.price === 0 ? 'OWNED' : `$${def.price}`}</span><i>${label}</i>`;
-    row.addEventListener('click', () => hooks.onBuy(def.id));
-    return row;
-  }
-
-  return {
-    setHealth(hp) {
-      setText(els['health-num'], 'hp', String(Math.max(0, Math.ceil(hp))));
-      const pct = Math.max(0, Math.min(100, hp));
-      if (last.get('hpPct') !== pct) {
-        last.set('hpPct', pct);
-        els['health-fill'].style.width = `${pct}%`;
-        els['health-fill'].classList.toggle('low', pct <= 30);
-      }
-    },
-    setAmmo(mag, reserve) {
-      setText(els['ammo-mag'], 'mag', String(mag));
-      setText(els['ammo-reserve'], 'res', `/ ${reserve}`);
-    },
-    setWeapon(name) {
-      setText(els['weapon-name'], 'wname', name);
-    },
-    setGrenades(frag, smoke) {
-      setText(els.grenades, 'nades', `Frag ${frag} · Smoke ${smoke}`);
-    },
-    setTimer(seconds, planted) {
-      const s = Math.max(0, Math.ceil(seconds));
-      const text = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-      setText(els.timer, 'timer', text);
-      els.timer.classList.toggle('urgent', s <= 10 || planted);
-    },
-    setScore(a, b, round) {
-      setText(els.score, 'score', `${a} — ${b}`);
-      setText(els['round-label'], 'round', `ROUND ${round}`);
-    },
-    setMoney(value) {
-      setText(els.money, 'money', `$${value.toLocaleString('en-US')}`);
-      setText(els['buy-money'], 'buymoney', `$${value.toLocaleString('en-US')}`);
-    },
-    setKills(k, d) {
-      setText(els.kills, 'kd', `${k} K · ${d} D`);
-    },
-    setCrosshair(px) {
-      const v = Math.round(px);
-      if (last.get('xhair') === v) return;
-      last.set('xhair', v);
-      els.crosshair.style.setProperty('--gap', `${v}px`);
-    },
-    hitMarker(killed) {
-      els.hitmarker.classList.add('on');
-      els.hitmarker.classList.toggle('kill', killed);
-      clearTimeout(hitTimer);
-      hitTimer = setTimeout(() => els.hitmarker.classList.remove('on', 'kill'), 110);
-    },
-    damageFlash() {
-      els.vignette.classList.add('on');
-      setTimeout(() => els.vignette.classList.remove('on'), 220);
-    },
-    killFeed(killer, victim, weapon, headshot) {
-      const row = document.createElement('div');
-      row.className = 'feed-row';
-      row.textContent = `${killer}  ▸  ${victim}  ·  ${weapon}${headshot ? '  ◉' : ''}`;
-      els.feed.prepend(row);
-      while (els.feed.children.length > 5) els.feed.removeChild(els.feed.lastChild);
-      setTimeout(() => row.remove(), 5200);
-    },
-    showBanner(title, sub, hold = false) {
-      els['banner-title'].textContent = title;
-      els['banner-sub'].textContent = sub || '';
-      els.banner.hidden = false;
-      clearTimeout(bannerTimer);
-      if (!hold) {
-        bannerTimer = setTimeout(() => {
-          els.banner.hidden = true;
-        }, 3400);
-      }
-    },
-    hideBanner() {
-      els.banner.hidden = true;
-    },
-    setPlant(frac, label) {
-      if (frac <= 0) {
-        els['plant-bar'].hidden = true;
-        return;
-      }
-      els['plant-bar'].hidden = false;
-      els['plant-fill'].style.width = `${Math.round(frac * 100)}%`;
-      setText(els['plant-label'], 'plant', label);
-    },
-    setSpectate(name) {
-      if (name) {
-        els.spectate.hidden = false;
-        setText(els.spectate, 'spec', `SPECTATING — ${name}`);
-      } else {
-        els.spectate.hidden = true;
-      }
-    },
-    showOverlay(mode, detail) {
-      const text = COPY[mode];
-      els['overlay-title'].textContent = text.title;
-      els['overlay-copy'].textContent = detail || text.copy;
-      els.play.textContent = text.action;
-      els.overlay.hidden = false;
-      els.play.focus();
-    },
-    hideOverlay() {
-      els.overlay.hidden = true;
-    },
-    showBuy(show, weapons, grenades, money, owned) {
-      els['buy-menu'].hidden = !show;
-      if (!show) return;
-      const list = els['buy-list'];
-      list.innerHTML = '';
-      for (const def of weapons) {
-        list.appendChild(buyRow(def, `${def.damage} dmg · ${def.mag} rnd`, owned.has(def.id), money >= def.price));
-      }
-      for (const def of grenades) {
-        list.appendChild(buyRow(def, def.id === 'frag' ? '120 dmg blast' : 'Blocks sight 12s', false, money >= def.price));
-      }
-    },
-    drawMinimap,
-    onPlay(handler) {
-      els.play.addEventListener('click', handler);
-    },
+  const fmtTime = (t) => {
+    const s = Math.max(0, Math.ceil(t));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
   };
+
+  function feed(msg, cls = '') {
+    const div = document.createElement('div');
+    if (cls) div.className = cls;
+    div.textContent = msg;
+    els.feed.prepend(div);
+    while (els.feed.children.length > 6) els.feed.lastChild.remove();
+    setTimeout(() => { div.style.opacity = '0.25'; }, 6000);
+    setTimeout(() => { div.remove(); }, 8000);
+  }
+
+  function showBanner(title, sub, cls = '') {
+    els.banner.className = `hud ${cls}`;
+    els.banner.innerHTML = `<h1>${title}</h1><p>${sub}</p>`;
+    bannerTimer = 3.5;
+  }
+
+  function hideBanner() {
+    els.banner.classList.add('hidden');
+    bannerTimer = 0;
+  }
+
+  function hitmarker() { hitTimer = 0.18; }
+
+  function renderBuy() {
+    const rows = [];
+    for (const id of WEAPON_ORDER) {
+      const w = WEAPONS[id];
+      const owned = player.loadout.owned[id];
+      rows.push(`<tr data-buy="${id}"><td class="key">${WEAPON_ORDER.indexOf(id) + 1}</td><td>${w.name}<br><span style="color:#9fb0d0;font-size:12px">${w.desc}</span></td><td class="price ${owned ? 'own' : ''}">${owned ? 'OWNED' : '$' + w.price}</td></tr>`);
+    }
+    for (const [id, g] of Object.entries(GRENADES)) {
+      const n = player.loadout.grenades[id];
+      rows.push(`<tr data-buy="${id}"><td class="key">${id === 'frag' ? 5 : 6}</td><td>${g.name} ×${n}<br><span style="color:#9fb0d0;font-size:12px">${g.desc}</span></td><td class="price">$${g.price}</td></tr>`);
+    }
+    els.buylist.innerHTML = rows.join('');
+    els.buybal.textContent = `$${player.money}`;
+    for (const tr of els.buylist.querySelectorAll('tr')) {
+      tr.style.cursor = 'pointer';
+      tr.addEventListener('click', () => {
+        const r = player.buy(tr.dataset.buy);
+        if (!r.ok) feed(r.reason, 'sys');
+        renderBuy();
+        updateStatic();
+      });
+    }
+  }
+
+  function setBuyVisible(v) {
+    els.buy.classList.toggle('hidden', !v);
+    if (v) renderBuy();
+  }
+
+  function drawMinimap(now) {
+    const W = 170, H = 124;
+    const px = (x) => (x + 26) / 52 * W;
+    const py = (z) => (z + 19) / 38 * H;
+    mm.clearRect(0, 0, W, H);
+    mm.fillStyle = 'rgba(20,26,48,0.85)';
+    mm.fillRect(0, 0, W, H);
+    // cover
+    mm.fillStyle = '#4a4a55';
+    for (const c of world.colliders) {
+      if (c.x1 < -26 || c.x2 > 26) continue; // perimeter
+      mm.fillRect(px(c.x1), py(c.z1), px(c.x2) - px(c.x1), py(c.z2) - py(c.z1));
+    }
+    // sites
+    for (const s of Object.values(world.sites)) {
+      mm.strokeStyle = s.id === 'A' ? '#57c8ff' : '#ff9a57';
+      mm.lineWidth = 1.5;
+      mm.strokeRect(px(s.cx - s.hx), py(s.cz - s.hz), px(s.cx + s.hx) - px(s.cx - s.hx), py(s.cz + s.hz) - py(s.cz - s.hz));
+      mm.fillStyle = mm.strokeStyle;
+      mm.font = 'bold 9px sans-serif';
+      mm.textAlign = 'center';
+      mm.fillText(s.id, px(s.cx), py(s.cz) + 3);
+    }
+    // spike
+    if (G.spike.dropped) {
+      mm.fillStyle = '#ffd75e';
+      mm.beginPath(); mm.arc(px(G.spike.dropped.x), py(G.spike.dropped.z), 3, 0, Math.PI * 2); mm.fill();
+    }
+    if (G.plantedSite) {
+      const s = world.sites[G.plantedSite];
+      mm.fillStyle = '#ffd75e';
+      mm.beginPath(); mm.arc(px(s.cx), py(s.cz), 4, 0, Math.PI * 2); mm.fill();
+    }
+    // fighters: teammates always, enemies only while spotted
+    const drawDot = (f, color, r, ring = false) => {
+      mm.fillStyle = color;
+      mm.beginPath(); mm.arc(px(f.pos.x), py(f.pos.z), r, 0, Math.PI * 2); mm.fill();
+      if (ring) {
+        mm.strokeStyle = '#fff'; mm.lineWidth = 1;
+        mm.beginPath(); mm.arc(px(f.pos.x), py(f.pos.z), r + 2, 0, Math.PI * 2); mm.stroke();
+      }
+    };
+    if (player.alive) drawDot(player, '#ffffff', 3.5, true);
+    for (const b of bots.all()) {
+      if (!b.alive) continue;
+      if (b.team === 'atk') {
+        drawDot(b, '#57c8ff', 3);
+      } else if ((spotted.get(b.id) ?? 0) > now) {
+        drawDot(b, '#ff5d5d', 3);
+      }
+    }
+    // player view cone
+    if (player.alive) {
+      mm.strokeStyle = 'rgba(255,255,255,0.5)';
+      mm.beginPath();
+      mm.moveTo(px(player.pos.x), py(player.pos.z));
+      const a = Math.atan2(-Math.cos(player.yaw), -Math.sin(player.yaw));
+      mm.lineTo(px(player.pos.x) + Math.cos(a) * 12, py(player.pos.z) + Math.sin(a) * 12);
+      mm.stroke();
+    }
+  }
+
+  function updateSpotted(now) {
+    // enemies the player can see stay on the minimap for 3 seconds
+    for (const b of bots.all()) {
+      if (b.team !== 'def' || !b.alive || !player.alive) continue;
+      const dx = b.pos.x - player.pos.x, dz = b.pos.z - player.pos.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > 45) continue;
+      const facing = { x: -Math.sin(player.yaw), z: -Math.cos(player.yaw) };
+      const dot = (dx * facing.x + dz * facing.z) / (dist || 1);
+      if (dot < 0.35 && dist > 8) continue;
+      if (world.segmentBlocked(player.pos.x, 1.62, player.pos.z, b.pos.x, 1.1, b.pos.z)) continue;
+      spotted.set(b.id, now + 3);
+    }
+  }
+
+  function updateStatic() {
+    els.money.textContent = `$${player.money}`;
+    els.kd.textContent = `K ${player.kills}   D ${player.deaths}   K/D ${ctx.stats.kd()}`;
+    els.round.textContent = `ROUND ${G.round} / 7`;
+    const w = player.weapon;
+    els.wname.textContent = w.name;
+    const a = player.ammo;
+    els.ammo.innerHTML = `${a ? a.mag : 0} <small>/ ${a && a.reserve === Infinity ? '∞' : (a ? a.reserve : 0)}</small>`;
+    const slotTxt = WEAPON_ORDER
+      .filter((id) => player.loadout.owned[id])
+      .map((id, i) => `<b>${i + 1}</b> ${WEAPONS[id].name.split(' ')[1] ?? WEAPONS[id].name}`)
+      .join(' · ');
+    const nades = ` · <b>5</b> Frag ×${player.loadout.grenades.frag} · <b>6</b> Smoke ×${player.loadout.grenades.smoke}`;
+    els.slots.innerHTML = slotTxt + nades;
+  }
+
+  function update(dt, now) {
+    // timer / score / phase
+    const t = G.phase === 'planted' ? G.plantT : G.phaseT;
+    els.timer.textContent = fmtTime(t);
+    els.timer.classList.toggle('low', t <= 10 && (G.phase === 'live' || G.phase === 'planted'));
+    els.score.innerHTML = `<span class="atk">ATK ${G.scoreAtk}</span> — <span class="def">${G.scoreDef} DEF</span>`;
+    els.phase.textContent =
+      G.phase === 'buy' ? `Buy phase — push Site ${G.assignedSite?.id ?? ''}` :
+      G.phase === 'live' ? 'Round live' :
+      G.phase === 'planted' ? `Spike planted — Site ${G.plantedSite}` :
+      G.phase === 'end' ? (G.roundWinner === 'atk' ? 'Attackers take the round' : 'Defenders take the round') :
+      G.phase === 'matchend' ? 'Match over' : 'Lobby';
+    els.hpfill.style.width = `${player.hp}%`;
+    els.hpfill.style.background = player.hp > 50
+      ? 'linear-gradient(90deg,#37d67a,#7be495)'
+      : player.hp > 25 ? 'linear-gradient(90deg,#e8a13a,#ffd75e)' : 'linear-gradient(90deg,#e83a3a,#ff5d5d)';
+    els.hptext.innerHTML = `${Math.ceil(player.hp)} <small>HP</small>`;
+    updateStatic();
+
+    // crosshair + hitmarker
+    els.cross.classList.toggle('hidden', !player.alive || G.phase === 'buy');
+    if (hitTimer > 0) {
+      hitTimer -= dt;
+      els.hitmark.style.opacity = hitTimer > 0 ? '1' : '0';
+    }
+
+    // plant / defuse bar
+    if (player.channel) {
+      els.plant.classList.remove('hidden');
+      els.plantLabel.textContent = player.channel.type === 'plant' ? 'Planting spike' : 'Defusing spike';
+      els.plantfill.style.width = `${(player.channel.progress / player.channel.needed) * 100}%`;
+    } else {
+      els.plant.classList.add('hidden');
+    }
+
+    // contextual hint
+    let hint = '';
+    if (G.phase === 'buy') hint = 'Press <b>B</b> to buy — round starts soon';
+    else if (player.alive && player.hasSpike && !G.plantedSite) {
+      const site = world.siteAt(player.pos.x, player.pos.z);
+      hint = site && site.id === G.assignedSite.id
+        ? 'Hold <b>E</b> to plant the spike'
+        : `Carry the spike to <b>Site ${G.assignedSite.id}</b> — ${G.assignedSite.name}`;
+    } else if (G.phase === 'planted' && player.alive) {
+      const s = world.sites[G.plantedSite];
+      const d = Math.hypot(player.pos.x - s.cx, player.pos.z - s.cz);
+      hint = d < 2.2 ? 'Hold <b>E</b> to defuse' : `Spike planted at <b>Site ${G.plantedSite}</b> — defend it`;
+    } else if (!player.alive) hint = 'You are down — spectating your squad';
+    els.hint.innerHTML = hint;
+    els.hint.classList.toggle('hidden', hint === '');
+    els.spectate.classList.toggle('hidden', player.alive);
+
+    if (bannerTimer > 0 && !G.shot) {
+      bannerTimer -= dt;
+      if (bannerTimer <= 0) hideBanner();
+    }
+    updateSpotted(now);
+    drawMinimap(now);
+  }
+
+  function showGameHud(v) {
+    for (const id of ['vitals', 'weapon', 'topbar', 'wallet', 'minimap']) {
+      els[id].classList.toggle('hidden', !v);
+    }
+  }
+
+  return { feed, showBanner, hideBanner, hitmarker, renderBuy, setBuyVisible, update, showGameHud, updateStatic };
 }

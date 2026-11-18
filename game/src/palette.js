@@ -1,22 +1,34 @@
-// The look plan, in one place: dusk at an industrial harbour. Six neutrals, one accent
-// hue, and the two team colours. The same names are the CSS custom properties in index.html.
-// Nothing else in the code names a colour literal.
+// Palette — the dusk-harbour look of Meridian Docks. Every colour the world,
+// the teams and the HUD use lives here, so the art direction stays in one place.
+
 export const PALETTE = {
-  canvas: '#0d141d', // night sky / fog
-  surface: '#1c2733', // concrete
-  hairline: '#35424f', // steel trim
-  ink: '#ece7db', // warm off-white
-  muted: '#93a3b1', // mist grey-blue
-  accent: '#ff8a2a', // safety orange (Tidebreakers, the attackers)
-  teamB: '#35c4b5', // harbour teal (Harbour Watch, the defenders)
-  danger: '#e5484d', // damage red
-  rust: '#b4552d', // rusted container
-  teal: '#2e6f6a', // painted container
-  ochre: '#7a6a3f', // faded container
-  ground: '#232d38', // asphalt
-  lamp: '#ffc46b', // sodium lamp glow
+  skyTop: 0x2a3560,
+  skyHorizon: 0xd97b4f,
+  fog: 0x8a5f52,
+  ground: 0x3d3a38,
+  groundLine: 0x2e2c2a,
+  water: 0x14283e,
+  containerA: 0xb5502e,
+  containerB: 0x2e6b8a,
+  containerC: 0x7a7d33,
+  containerD: 0x5a4a6b,
+  crate: 0x8a6b42,
+  crane: 0xc2a23a,
+  craneDark: 0x6b5a22,
+  wall: 0x4a4a52,
+  wallTop: 0x62626e,
+  siteA: 0x57c8ff,
+  siteB: 0xff9a57,
+  attacker: 0x57c8ff,
+  defender: 0xff9a57,
+  spike: 0xffd75e,
+  tracerAtk: 0x9fdcff,
+  tracerDef: 0xffc49f,
+  muzzle: 0xffe9a8,
+  smoke: 0xb8bcc4,
+  hpGood: 0x37d67a,
+  hpLow: 0xff5d5d,
+  money: 0xffd75e,
 };
 
-export function shade(name) {
-  return PALETTE[name];
-}
+export const TEAM_COLOR = { atk: PALETTE.attacker, def: PALETTE.defender };
